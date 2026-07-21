@@ -13,6 +13,7 @@ reports that in get_model_status() rather than inventing numbers.
 """
 
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -21,7 +22,12 @@ from sklearn.ensemble import IsolationForest
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score
 from xgboost import XGBClassifier
-import shap
+
+SHAP_ENABLED = os.getenv("DISABLE_SHAP", "0").lower() not in {"1", "true", "yes"}
+if SHAP_ENABLED:
+    import shap
+else:
+    shap = None
 
 logger = logging.getLogger("ai_engine")
 
@@ -39,6 +45,13 @@ ROLL_WINDOW = 6
 MIN_ROWS_TO_TRAIN_RISK = 200
 MIN_ROWS_TO_TRAIN_INCIDENT = 40
 MIN_CLASS_COUNT_TO_TRAIN_INCIDENT = 5
+
+LOW_MEMORY_MODE = os.getenv("LOW_MEMORY_MODE", "0").lower() in {"1", "true", "yes"}
+MAX_RISK_TRAIN_ROWS = int(os.getenv("MAX_RISK_TRAIN_ROWS", "50000" if LOW_MEMORY_MODE else "0"))
+MAX_ANOMALY_TRAIN_ROWS = int(os.getenv("MAX_ANOMALY_TRAIN_ROWS", "20000" if LOW_MEMORY_MODE else "0"))
+RISK_N_ESTIMATORS = int(os.getenv("RISK_N_ESTIMATORS", "80" if LOW_MEMORY_MODE else "200"))
+INCIDENT_N_ESTIMATORS = int(os.getenv("INCIDENT_N_ESTIMATORS", "80" if LOW_MEMORY_MODE else "150"))
+MODEL_N_JOBS = int(os.getenv("MODEL_N_JOBS", "2" if LOW_MEMORY_MODE else "-1"))
 
 
 class AIEngine:
@@ -174,6 +187,15 @@ class AIEngine:
             logger.warning("Not enough rows (%d) to train risk model.", len(feat_df))
             return
 
+        if 0 < MAX_RISK_TRAIN_ROWS < len(feat_df):
+            feat_df, _ = train_test_split(
+                feat_df,
+                train_size=MAX_RISK_TRAIN_ROWS,
+                random_state=42,
+                stratify=feat_df["risk_label"],
+            )
+            logger.info("Low-memory mode: sampled %d rows for risk training.", len(feat_df))
+
         self.gas_ppm_p95 = float(sensor["gas_ppm"].quantile(0.95))
         self.vibration_p95 = float(sensor["vibration"].quantile(0.95))
 
@@ -195,14 +217,15 @@ class AIEngine:
         )
 
         model = XGBClassifier(
-            n_estimators=200,
+            n_estimators=RISK_N_ESTIMATORS,
             max_depth=6,
             learning_rate=0.1,
             objective="multi:softprob",
             num_class=3,
             eval_metric="mlogloss",
+            tree_method="hist",
             random_state=42,
-            n_jobs=-1,
+            n_jobs=MODEL_N_JOBS,
         )
         model.fit(X_train, y_train, sample_weight=w_train)
 
@@ -218,6 +241,8 @@ class AIEngine:
         }
 
         try:
+            if shap is None:
+                raise RuntimeError("SHAP disabled by DISABLE_SHAP")
             self.risk_explainer = shap.TreeExplainer(model)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not build SHAP explainer: %s", exc)
@@ -253,13 +278,14 @@ class AIEngine:
         )
 
         model = XGBClassifier(
-            n_estimators=150,
+            n_estimators=INCIDENT_N_ESTIMATORS,
             max_depth=5,
             learning_rate=0.1,
             objective="binary:logistic",
             eval_metric="logloss",
+            tree_method="hist",
             random_state=42,
-            n_jobs=-1,
+            n_jobs=MODEL_N_JOBS,
         )
         model.fit(X_train, y_train)
         preds = model.predict(X_test)
@@ -279,7 +305,10 @@ class AIEngine:
         X = sensor[SENSOR_BASE_COLS].fillna(0)
         if len(X) < MIN_ROWS_TO_TRAIN_RISK:
             return
-        detector = IsolationForest(contamination=0.02, random_state=42, n_jobs=-1)
+        if 0 < MAX_ANOMALY_TRAIN_ROWS < len(X):
+            X = X.sample(n=MAX_ANOMALY_TRAIN_ROWS, random_state=42)
+            logger.info("Low-memory mode: sampled %d rows for anomaly training.", len(X))
+        detector = IsolationForest(contamination=0.02, random_state=42, n_jobs=MODEL_N_JOBS)
         detector.fit(X)
         self.anomaly_detector = detector
         logger.info("Anomaly detector fit on %d sensor rows.", len(X))

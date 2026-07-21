@@ -9,7 +9,7 @@ backend/safety_intelligence.db
 **/node_modules/
 **/dist/
 
-# Environment files
+# Local environment files
 industrial-frontend/.env
 industrial-frontend/.env.local
 

@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: industrial-safety-etgenai
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    autoDeployTrigger: commit
+    envVars:
+      - key: LOW_MEMORY_MODE
+        value: "1"
+      - key: SKIP_SQLITE
+        value: "1"
+      - key: DISABLE_SHAP
+        value: "1"
+      - key: PREDICTION_INTERVAL_SECONDS
+        value: "300"

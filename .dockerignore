@@ -1,0 +1,11 @@
+.git
+.github
+**/node_modules
+**/dist
+**/venv
+**/.venv
+**/__pycache__
+**/*.pyc
+backend/safety_intelligence.db
+industrial-frontend/.env
+industrial-frontend/.env.local

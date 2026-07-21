@@ -16,18 +16,23 @@ derived from them by ai_engine.AIEngine. Nothing here fabricates values.
 import asyncio
 import json
 import logging
+import os
 import sqlite3
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from ai_engine import AIEngine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("backend")
+
+BASE_DIR = Path(__file__).resolve().parent
 
 
 # ======================================================================
@@ -35,8 +40,10 @@ logger = logging.getLogger("backend")
 # ======================================================================
 
 class AppConfig:
-    DATA_DIR = "./data"
-    DB_PATH = "safety_intelligence.db"
+    DATA_DIR = str(BASE_DIR / "data")
+    DB_PATH = str(BASE_DIR / "safety_intelligence.db")
+    LOW_MEMORY_MODE = os.getenv("LOW_MEMORY_MODE", "0").lower() in {"1", "true", "yes"}
+    SKIP_SQLITE = os.getenv("SKIP_SQLITE", "0").lower() in {"1", "true", "yes"}
 
     # filename -> (loader kind, parse_dates)
     FILES = {
@@ -50,7 +57,7 @@ class AppConfig:
         "plant_layout": ("json", None),
     }
 
-    PREDICTION_INTERVAL_SECONDS = 60
+    PREDICTION_INTERVAL_SECONDS = int(os.getenv("PREDICTION_INTERVAL_SECONDS", "60"))
 
 
 # ======================================================================
@@ -76,6 +83,17 @@ class DataStore:
                     for col in parse_dates or []:
                         if col in df.columns:
                             df[col] = pd.to_datetime(df[col], errors="coerce")
+                    if AppConfig.LOW_MEMORY_MODE:
+                        df = self._optimize_dataframe(df)
+                        # No endpoint exposes worker-location history. Keeping the
+                        # latest record per worker preserves every current-worker
+                        # feature while avoiding ~200k redundant rows on small hosts.
+                        if name == "worker_location" and {"worker_id", "timestamp"}.issubset(df.columns):
+                            df = (
+                                df.sort_values("timestamp")
+                                .drop_duplicates(subset=["worker_id"], keep="last")
+                                .copy()
+                            )
                     self.dfs[name] = df
                     logger.info("Loaded %s -> shape=%s", filename, df.shape)
                 else:
@@ -86,7 +104,23 @@ class DataStore:
                 self.load_errors[name] = str(exc)
                 logger.error("Failed to load %s: %s", filename, exc)
 
-        self._init_sqlite()
+        if AppConfig.SKIP_SQLITE:
+            logger.info("Skipping unused SQLite mirror (SKIP_SQLITE enabled).")
+        else:
+            self._init_sqlite()
+
+    @staticmethod
+    def _optimize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+        """Reduce RAM without changing the values returned by the API."""
+        for col in df.select_dtypes(include=["float64"]).columns:
+            df[col] = pd.to_numeric(df[col], downcast="float")
+        for col in df.select_dtypes(include=["int64"]).columns:
+            df[col] = pd.to_numeric(df[col], downcast="integer")
+        for col in df.select_dtypes(include=["object"]).columns:
+            unique_count = df[col].nunique(dropna=False)
+            if unique_count <= 1000 and unique_count <= max(32, len(df) // 10):
+                df[col] = df[col].astype("category")
+        return df
 
     def _init_sqlite(self) -> None:
         """Mirror the dataframes into SQLite with indexes for relational queries."""
@@ -381,7 +415,14 @@ def explain_prediction(equipment_id: str) -> Dict[str, Any]:
     return explanation
 
 
+# Serve the production React build from the same process and domain as the API.
+# The Docker build copies Vite's `dist` output into backend/static.
+STATIC_DIR = BASE_DIR / "static"
+if STATIC_DIR.is_dir():
+    app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="frontend")
+
+
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
